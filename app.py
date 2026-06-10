@@ -49,6 +49,16 @@ def _normalize_tokens(value: str) -> set[str]:
     return {x for x in clean.split() if len(x) >= 2}
 
 
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def _album_key(artist: str, title: str) -> str:
+    a = _normalize_text(artist)
+    t = _normalize_text(title)
+    return f"{a}|{t}"
+
+
 def _to_release_id(raw: Any) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -80,7 +90,7 @@ def _overlap(a: set[str], b: set[str]) -> float:
     return len(a.intersection(b)) / denom
 
 
-def _score(seed: ReleaseSeed, row: dict[str, Any]) -> tuple[float, str]:
+def _score(seed: ReleaseSeed, row: dict[str, Any]) -> tuple[float, list[str]]:
     seed_artist = _normalize_tokens(seed.artist)
     seed_title = _normalize_tokens(seed.title)
     seed_genres = {x.strip().lower() for x in seed.genres if x.strip()}
@@ -120,17 +130,59 @@ def _score(seed: ReleaseSeed, row: dict[str, Any]) -> tuple[float, str]:
     want = max(0, int(row.get("want", 0) or 0))
     score += min(7.0, math.log10(1 + have + want) * 2.2)
 
+    reasons: list[str] = []
     if style_overlap > 0.0:
-        reason = "Shares style profile"
-    elif genre_overlap > 0.0:
-        reason = "Shares genre profile"
-    elif artist_overlap > 0.0:
-        reason = "Similar artist signal"
-    elif seed_year and row_year and abs(seed_year - row_year) <= 2:
-        reason = "Close release era"
-    else:
-        reason = "Closest metadata similarity"
-    return score, reason
+        reasons.append("Similar style")
+    if genre_overlap > 0.0:
+        reasons.append("Same genre")
+    if artist_overlap > 0.0 and _normalize_text(seed.title) != _normalize_text(str(row.get("title") or "")):
+        reasons.append("Same artist, different album")
+    if seed_year and row_year and abs(seed_year - row_year) <= 3:
+        reasons.append("Same era")
+    if seed_format and row_format and seed_format in row_format:
+        reasons.append("Same format")
+    if seed_country and row_country and seed_country == row_country:
+        reasons.append("Same country")
+    if have + want >= 250:
+        reasons.append("Popular with collectors")
+    if not reasons:
+        reasons.append("Related metadata match")
+
+    return score, reasons
+
+
+def _discogs_numeric_id(release_id: str) -> int | None:
+    raw = str(release_id or "").strip()
+    if raw.startswith("discogs_r_"):
+        raw = raw.replace("discogs_r_", "", 1)
+    if raw.isdigit():
+        parsed = int(raw)
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _extract_barcode_or_catno(payload: dict[str, Any], fallback_catno: str = "") -> str:
+    identifiers = payload.get("identifiers") or []
+    for row in identifiers:
+        value = str((row or {}).get("value") or "").strip()
+        kind = str((row or {}).get("type") or "").lower()
+        if value and ("barcode" in kind or "bar code" in kind):
+            return value
+    catno = str(fallback_catno or "").strip()
+    return catno
+
+
+async def _discogs_release_payload(client: httpx.AsyncClient, release_id: str) -> dict[str, Any] | None:
+    numeric = _discogs_numeric_id(release_id)
+    if not numeric:
+        return None
+    response = await client.get(
+        f"{DISCOGS_BASE}/releases/{numeric}",
+        headers=_auth_headers(),
+        timeout=9.5,
+    )
+    response.raise_for_status()
+    return response.json() or None
 
 
 async def _discogs_search(client: httpx.AsyncClient, query: str, per_page: int = 20) -> list[dict[str, Any]]:
@@ -165,6 +217,7 @@ async def _discogs_search(client: httpx.AsyncClient, query: str, per_page: int =
                 "cover_image_url": row.get("cover_image") or row.get("thumb"),
                 "genres": row.get("genre") or [],
                 "styles": row.get("style") or [],
+                "catno": str(row.get("catno") or "").strip(),
                 "have": (row.get("community") or {}).get("have", 0),
                 "want": (row.get("community") or {}).get("want", 0),
             }
@@ -202,6 +255,7 @@ async def recommend(payload: RecommendRequest, x_api_key: str | None = Header(de
     if not deduped_queries:
         return {"recommendations": []}
 
+    seed_album_key = _album_key(seed.artist, seed.title)
     candidates: dict[str, dict[str, Any]] = {}
     async with httpx.AsyncClient() as client:
         for query in deduped_queries:
@@ -213,31 +267,49 @@ async def recommend(payload: RecommendRequest, x_api_key: str | None = Header(de
                 rid = _to_release_id(row.get("id"))
                 if not rid or rid == seed.id:
                     continue
+                if _album_key(str(row.get("artist") or ""), str(row.get("title") or "")) == seed_album_key:
+                    continue
                 if rid not in candidates:
                     candidates[rid] = row
             if len(candidates) >= 120:
                 break
 
-    scored: list[dict[str, Any]] = []
+    deduped_by_album: dict[str, dict[str, Any]] = {}
     for row in candidates.values():
-        score, reason = _score(seed, row)
+        score, reasons = _score(seed, row)
         if score <= 0:
             continue
-        scored.append(
-            {
-                "id": row.get("id"),
-                "artist": row.get("artist") or "Unknown Artist",
-                "title": row.get("title") or "Unknown Title",
-                "year": row.get("year"),
-                "country": row.get("country"),
-                "format": row.get("format"),
-                "label": row.get("label"),
-                "cover_image_url": row.get("cover_image_url"),
-                "score": round(score, 2),
-                "reason": reason,
-            }
-        )
+        entry = {
+            "id": row.get("id"),
+            "artist": row.get("artist") or "Unknown Artist",
+            "title": row.get("title") or "Unknown Title",
+            "year": row.get("year"),
+            "country": row.get("country"),
+            "format": row.get("format"),
+            "label": row.get("label"),
+            "cover_image_url": row.get("cover_image_url"),
+            "score": round(score, 2),
+            "reason": " | ".join(reasons[:3]),
+            "ref_code": str(row.get("catno") or "").strip() or None,
+        }
+        album_key = _album_key(entry["artist"], entry["title"])
+        prev = deduped_by_album.get(album_key)
+        if not prev or float(prev.get("score", 0)) < float(entry.get("score", 0)):
+            deduped_by_album[album_key] = entry
 
+    scored = list(deduped_by_album.values())
     scored.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
     limit = max(1, min(15, int(payload.limit or 8)))
-    return {"recommendations": scored[:limit]}
+    top = scored[: max(limit * 2, 12)]
+
+    # Enrich with barcode/catalog details for better explanation in UI.
+    async with httpx.AsyncClient() as client:
+        for row in top:
+            try:
+                payload_row = await _discogs_release_payload(client, str(row.get("id") or ""))
+            except Exception:
+                payload_row = None
+            if payload_row:
+                row["ref_code"] = _extract_barcode_or_catno(payload_row, str(row.get("ref_code") or ""))
+
+    return {"recommendations": top[:limit]}
