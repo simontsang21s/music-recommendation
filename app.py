@@ -1,8 +1,10 @@
 import math
 import os
 import re
+import time
 from typing import Any
 
+import asyncio
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
@@ -15,6 +17,8 @@ DISCOGS_USER_AGENT = os.getenv(
     "Record2ndRecommender/1.0 (+https://main.better-discogs-web.pages.dev)",
 )
 RECS_API_KEY = os.getenv("PY_RECS_API_KEY", "").strip()
+RECS_CACHE_TTL_SECONDS = 8 * 60
+RECS_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
 app = FastAPI(title=APP_NAME, version="1.0.0")
 
@@ -151,51 +155,34 @@ def _score(seed: ReleaseSeed, row: dict[str, Any]) -> tuple[float, list[str]]:
     return score, reasons
 
 
-def _discogs_numeric_id(release_id: str) -> int | None:
-    raw = str(release_id or "").strip()
-    if raw.startswith("discogs_r_"):
-        raw = raw.replace("discogs_r_", "", 1)
-    if raw.isdigit():
-        parsed = int(raw)
-        return parsed if parsed > 0 else None
-    return None
-
-
-def _extract_barcode_or_catno(payload: dict[str, Any], fallback_catno: str = "") -> str:
-    identifiers = payload.get("identifiers") or []
-    for row in identifiers:
-        value = str((row or {}).get("value") or "").strip()
-        kind = str((row or {}).get("type") or "").lower()
-        if value and ("barcode" in kind or "bar code" in kind):
-            return value
-    catno = str(fallback_catno or "").strip()
-    return catno
-
-
-async def _discogs_release_payload(client: httpx.AsyncClient, release_id: str) -> dict[str, Any] | None:
-    numeric = _discogs_numeric_id(release_id)
-    if not numeric:
-        return None
-    response = await client.get(
-        f"{DISCOGS_BASE}/releases/{numeric}",
-        headers=_auth_headers(),
-        timeout=9.5,
-    )
-    response.raise_for_status()
-    return response.json() or None
-
-
 async def _discogs_search(client: httpx.AsyncClient, query: str, per_page: int = 20) -> list[dict[str, Any]]:
     if not query.strip():
         return []
-    response = await client.get(
-        f"{DISCOGS_BASE}/database/search",
-        params={"q": query, "type": "release", "per_page": per_page, "page": 1},
-        headers=_auth_headers(),
-        timeout=9.5,
-    )
-    response.raise_for_status()
-    payload = response.json() or {}
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            response = await client.get(
+                f"{DISCOGS_BASE}/database/search",
+                params={"q": query, "type": "release", "per_page": per_page, "page": 1},
+                headers=_auth_headers(),
+                timeout=9.5,
+            )
+            if response.status_code == 429 and attempt < 2:
+                await asyncio.sleep(0.65 * (attempt + 1))
+                continue
+            response.raise_for_status()
+            payload = response.json() or {}
+            break
+        except Exception as error:
+            last_error = error
+            if attempt < 2:
+                await asyncio.sleep(0.45 * (attempt + 1))
+                continue
+            raise error
+    else:
+        if last_error:
+            raise last_error
+        payload = {}
     items = payload.get("results") or []
     out: list[dict[str, Any]] = []
     for row in items:
@@ -238,6 +225,12 @@ async def recommend(payload: RecommendRequest, x_api_key: str | None = Header(de
     seed = payload.release
     if not seed.id:
         raise HTTPException(status_code=400, detail="release.id is required.")
+    cache_key = seed.id.strip()
+    now = time.time()
+    cached = RECS_CACHE.get(cache_key)
+    if cached and (now - cached[0]) <= RECS_CACHE_TTL_SECONDS:
+        limit = max(1, min(15, int(payload.limit or 8)))
+        return {"recommendations": cached[1][:limit]}
 
     queries: list[str] = []
     if seed.artist and seed.title:
@@ -250,7 +243,7 @@ async def recommend(payload: RecommendRequest, x_api_key: str | None = Header(de
         queries.extend(seed.genres[:3])
     queries = [q.strip() for q in queries if q and q.strip()]
     # keep order, remove dupes
-    deduped_queries = list(dict.fromkeys(queries))[:6]
+    deduped_queries = list(dict.fromkeys(queries))[:4]
 
     if not deduped_queries:
         return {"recommendations": []}
@@ -260,7 +253,7 @@ async def recommend(payload: RecommendRequest, x_api_key: str | None = Header(de
     async with httpx.AsyncClient() as client:
         for query in deduped_queries:
             try:
-                rows = await _discogs_search(client, query, per_page=24)
+                rows = await _discogs_search(client, query, per_page=14)
             except Exception:
                 continue
             for row in rows:
@@ -300,16 +293,6 @@ async def recommend(payload: RecommendRequest, x_api_key: str | None = Header(de
     scored = list(deduped_by_album.values())
     scored.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
     limit = max(1, min(15, int(payload.limit or 8)))
-    top = scored[: max(limit * 2, 12)]
-
-    # Enrich with barcode/catalog details for better explanation in UI.
-    async with httpx.AsyncClient() as client:
-        for row in top:
-            try:
-                payload_row = await _discogs_release_payload(client, str(row.get("id") or ""))
-            except Exception:
-                payload_row = None
-            if payload_row:
-                row["ref_code"] = _extract_barcode_or_catno(payload_row, str(row.get("ref_code") or ""))
-
+    top = scored[: max(limit, 8)]
+    RECS_CACHE[cache_key] = (now, top)
     return {"recommendations": top[:limit]}
